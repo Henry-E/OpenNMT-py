@@ -141,9 +141,9 @@ def train_model(model, train_data, valid_data, fields, optim):
         print('')
 
         # 1. Train for one epoch on the training set.
-        train_stats = trainer.train(epoch, report_func)
-        print('Train perplexity: %g' % train_stats.ppl())
-        print('Train accuracy: %g' % train_stats.accuracy())
+        # train_stats = trainer.train(epoch, report_func)
+        # print('Train perplexity: %g' % train_stats.ppl())
+        # print('Train accuracy: %g' % train_stats.accuracy())
 
         # 2. Validate on the validation set.
         valid_stats = trainer.validate()

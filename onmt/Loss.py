@@ -54,6 +54,11 @@ class LossComputeBase(nn.Module):
 
         return batch_stats
 
+    def compute_full_loss(self, outputs, batch, attns):
+            gen_state = make_gen_state(
+                outputs, batch, attns, (0, batch.tgt.size(0)), self.copy_attn)
+            return self.forward(batch, **gen_state)
+
     def stats(self, loss, scores, target):
         """
         Compute and return a Statistics object.
