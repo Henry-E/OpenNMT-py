@@ -268,6 +268,9 @@ def translate_opts(parser):
                         help="Create dynamic dictionaries")
     parser.add_argument('-share_vocab', action='store_true',
                         help="Share source and target vocabulary")
+    # custom temperature options
+    parser.add_argument('-temperature', type=float, default=None,
+                        help="Set temperature for random sampling")
 
 
 def add_md_help_argument(parser):

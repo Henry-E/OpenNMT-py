@@ -11,7 +11,7 @@ import onmt
 
 class Beam(object):
     def __init__(self, size, n_best=1, cuda=False, vocab=None,
-                 global_scorer=None):
+                 global_scorer=None, temperature=None):
 
         self.size = size
         self.tt = torch.cuda if cuda else torch
@@ -43,6 +43,10 @@ class Beam(object):
         # Information for global scoring.
         self.globalScorer = global_scorer
         self.globalState = {}
+
+        # TODO figure out how to get it in from the external opt
+        # Temperature for random sampling
+        self.temperature = temperature
 
     def getCurrentState(self):
         "Get the outputs for the current timestep."
@@ -77,7 +81,15 @@ class Beam(object):
         else:
             beamLk = wordLk[0]
         flatBeamLk = beamLk.view(-1)
-        bestScores, bestScoresId = flatBeamLk.topk(self.size, 0, True, True)
+        # import ipdb; ipdb.set_trace()
+        if self.temperature:
+            prediction = flatBeamLk.div(self.temperature)
+            probs = prediction.exp()
+            norm_probs = probs.div(probs.sum())
+            bestScoresId = norm_probs.multinomial(self.size)
+            bestScores = flatBeamLk[bestScoresId]
+        else:
+            bestScores, bestScoresId = flatBeamLk.topk(self.size, 0, True, True)
 
         self.allScores.append(self.scores)
         self.scores = bestScores
