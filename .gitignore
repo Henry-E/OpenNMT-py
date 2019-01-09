@@ -1,4 +1,5 @@
 # repo-specific stuff
+*.swp
 pred.txt
 multi-bleu.perl
 *.pt
