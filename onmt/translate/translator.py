@@ -326,9 +326,9 @@ class Translator(object):
         assert self.block_ngram_repeat == 0
 
         batch_size = batch.batch_size
-        vocab = self.fields["tgt"].vocab
-        start_token = vocab.stoi[self.fields["tgt"].init_token]
-        end_token = vocab.stoi[self.fields["tgt"].eos_token]
+        vocab = self.fields["tgt"][0][1].vocab
+        start_token = vocab.stoi[self.fields["tgt"][0][1].init_token]
+        end_token = vocab.stoi[self.fields["tgt"][0][1].eos_token]
 
         # Encoder forward.
         src, enc_states, memory_bank, src_lengths = self._run_encoder(
