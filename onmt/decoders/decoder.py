@@ -90,10 +90,13 @@ class RNNDecoderBase(nn.Module):
 
         # Set up the standard attention.
         self._coverage = coverage_attn
-        self.attn = onmt.modules.GlobalAttention(
-            hidden_size, coverage=coverage_attn,
-            attn_type=attn_type, attn_func=attn_func
-        )
+        if attn_type == 'disabled':
+            self.attn = None
+        else:
+            self.attn = onmt.modules.GlobalAttention(
+                hidden_size, coverage=coverage_attn,
+                attn_type=attn_type, attn_func=attn_func
+            )
 
         # Set up a separated copy attention layer, if needed.
         self._copy = False
@@ -183,6 +186,10 @@ class RNNDecoderBase(nn.Module):
         # TODO change the way attns is returned dict => list or tuple (onnx)
         return dec_outs, attns
 
+    def _create_fake_align_vector(self, memory_bank):
+        batch, source_l, dim = memory_bank.size()
+        p_attn = torch.zeros([batch, source_l], dtype=torch.float32)
+        return p_attn
 
 class StdRNNDecoder(RNNDecoderBase):
     """
@@ -241,15 +248,20 @@ class StdRNNDecoder(RNNDecoderBase):
         # END
 
         # Calculate the attention.
-        dec_outs, p_attn = self.attn(
-            rnn_output.transpose(0, 1).contiguous(),
-            memory_bank.transpose(0, 1),
-            memory_lengths=memory_lengths
-        )
-        attns["std"] = p_attn
+        if self.attn is not None:
+            dec_outs, p_attn = self.attn(
+                rnn_output.transpose(0, 1).contiguous(),
+                memory_bank.transpose(0, 1),
+                memory_lengths=memory_lengths
+            )
+            attns["std"] = p_attn
+        else:
+            # Skip if attention is not set
+            dec_outs = rnn_output
+            p_attn = self._create_fake_align_vector(memory_bank.transpose(0, 1))
 
         # Calculate the context gate.
-        if self.context_gate is not None:
+        if self.context_gate is not None and self.attn is not None:
             dec_outs = self.context_gate(
                 emb.view(-1, emb.size(2)),
                 rnn_output.view(-1, rnn_output.size(2)),
@@ -333,11 +345,17 @@ class InputFeedRNNDecoder(RNNDecoderBase):
             emb_t = emb_t.squeeze(0)
             decoder_input = torch.cat([emb_t, input_feed], 1)
             rnn_output, dec_state = self.rnn(decoder_input, dec_state)
-            decoder_output, p_attn = self.attn(
-                rnn_output,
-                memory_bank.transpose(0, 1),
-                memory_lengths=memory_lengths)
-            if self.context_gate is not None:
+            if self.attn is not None:
+                decoder_output, p_attn = self.attn(
+                    rnn_output,
+                    memory_bank.transpose(0, 1),
+                    memory_lengths=memory_lengths)
+            else:
+                decoder_output = rnn_output
+                p_attn = self._create_fake_align_vector(
+                        memory_bank.transpose(0, 1))
+
+            if self.context_gate is not None and self.attn is not None:
                 # TODO: context gate should be employed
                 # instead of second RNN transform.
                 decoder_output = self.context_gate(
