@@ -10,8 +10,8 @@ from onmt.translate.translator import build_translator
 import onmt.opts as opts
 
 
-def main(opt):
-    translator = build_translator(opt, report_score=True)
+def main(opt, logger=None):
+    translator = build_translator(opt, report_score=True, logger=logger)
     translator.translate(
         src=opt.src,
         tgt=opt.tgt,
@@ -32,4 +32,4 @@ if __name__ == "__main__":
 
     opt = parser.parse_args()
     logger = init_logger(opt.log_file)
-    main(opt)
+    main(opt, logger)

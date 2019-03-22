@@ -29,7 +29,7 @@ def main(opt):
                                                       report_score=False)
     # TODO add an opt for generating num stories
     for _ in range(2):
-        story_so_far = ['The plot featured copious amounts of violence and incest .']
+        story_so_far = ['The lobster was born from great depths .']
         num_lines = 0
         while num_lines < 2:
             num_lines += 1
