@@ -1,6 +1,9 @@
 import torch
 
+from collections import Counter
+
 from onmt.translate.decode_strategy import DecodeStrategy
+
 
 
 class BeamSearch(DecodeStrategy):
@@ -56,7 +59,18 @@ class BeamSearch(DecodeStrategy):
     def __init__(self, beam_size, batch_size, pad, bos, eos, n_best, mb_device,
                  global_scorer, min_length, max_length, return_attention,
                  block_ngram_repeat, exclusion_tokens, memory_lengths,
-                 stepwise_penalty, ratio):
+                 stepwise_penalty, ratio, src_counter):
+        # import ipdb; ipdb.set_trace()
+        # TODO make this optional
+        # ignore the scoping brackets
+        # src_tokens = [tok for tok in src[:, 0, 0].tolist() if tok not in [4, 5]]
+        # num_tokens = len(src_tokens)
+
+        # # min_length = num_tokens - 1
+        # # max_length = num_tokens
+        # # ratio = 1
+        self.src_counter = src_counter
+
         super(BeamSearch, self).__init__(
             pad, bos, eos, batch_size, mb_device, beam_size, min_length,
             block_ngram_repeat, exclusion_tokens, return_attention,
@@ -118,6 +132,21 @@ class BeamSearch(DecodeStrategy):
         return self.select_indices.view(self.batch_size, self.beam_size)\
             .fmod(self.beam_size)
 
+    def restrict_repetition(self, log_probs):
+        for path_idx in range(self.alive_seq.shape[0]):
+            # skip BOS
+            hyp = self.alive_seq[path_idx, 1:]
+            this_counter = Counter(hyp.tolist())
+            remaining_toks = self.src_counter - this_counter
+            # make list of length vocab size
+            disallowed_token_idxs = [True] * log_probs.size(-1)
+            for key in remaining_toks:
+                disallowed_token_idxs[key] = False
+            disallowed_lookup = torch.LongTensor(disallowed_token_idxs)
+            log_probs[path_idx, disallowed_lookup] = -10e20
+            # if any(this_counter - self.src_counter):
+            #     log_probs[path_idx] = -10e20
+
     def advance(self, log_probs, attn):
         vocab_size = log_probs.size(-1)
 
@@ -138,6 +167,7 @@ class BeamSearch(DecodeStrategy):
         log_probs += self.topk_log_probs.view(_B * self.beam_size, 1)
 
         self.block_ngram_repeats(log_probs)
+        self.restrict_repetition(log_probs)
 
         # if the sequence ends now, then the penalty is the current
         # length + 1, to include the EOS token

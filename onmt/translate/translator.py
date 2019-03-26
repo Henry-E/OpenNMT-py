@@ -6,6 +6,7 @@ import os
 import math
 import time
 from itertools import count
+from collections import Counter
 
 import torch
 
@@ -586,6 +587,19 @@ class Translator(object):
             # or [ tgt_len, batch_size, vocab ] when full sentence
         return log_probs, attn
 
+    def _get_src_counter(self, src_vocab, src, vocab_size):
+        extended_vocab_count = Counter()
+        for key, value in src_vocab.freqs.items():
+            if key in ['_(', ')_']:
+                continue
+            this_idx = src_vocab.stoi[key]
+            extended_idx = this_idx + vocab_size
+            extended_vocab_count[extended_idx] = value
+        original_vocab_count = Counter(
+            [tok for tok in src[:, 0, 0].tolist() if tok not in [0, 4, 5,]])
+        total_count = extended_vocab_count + original_vocab_count
+        return total_count
+
     def _translate_batch(
             self,
             batch,
@@ -631,6 +645,10 @@ class Translator(object):
             mb_device = memory_bank.device
         memory_lengths = tile(src_lengths, beam_size)
 
+        # TODO make this optional
+        vocab_size = len(self.fields['src'].fields[0][1].vocab)
+        src_counter = self._get_src_counter(src_vocabs[batch.indices[0]], src, vocab_size)
+
         # (0) pt 2, prep the beam object
         beam = BeamSearch(
             beam_size,
@@ -648,7 +666,8 @@ class Translator(object):
             stepwise_penalty=self.stepwise_penalty,
             block_ngram_repeat=self.block_ngram_repeat,
             exclusion_tokens=self._exclusion_idxs,
-            memory_lengths=memory_lengths)
+            memory_lengths=memory_lengths,
+            src_counter=src_counter)
 
         for step in range(max_length):
             decoder_input = beam.current_predictions.view(1, -1, 1)
