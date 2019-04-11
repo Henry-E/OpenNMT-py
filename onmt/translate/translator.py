@@ -19,6 +19,8 @@ from onmt.translate.random_sampling import RandomSampling
 from onmt.utils.misc import tile, set_random_seed
 from onmt.modules.copy_generator import collapse_copy_scores
 
+from anytree import Node
+
 
 def build_translator(opt, report_score=True, logger=None, out_file=None):
     if out_file is None:
@@ -587,6 +589,50 @@ class Translator(object):
             # or [ tgt_len, batch_size, vocab ] when full sentence
         return log_probs, attn
 
+
+    def _get_src_tree(self, src, src_map):
+        tok_vocab = self.fields['src'].fields[0][1].vocab
+        id_vocab = self.fields['src'].fields[2][1].vocab
+        head_vocab = self.fields['src'].fields[3][1].vocab
+        tok_vocab_size = len(tok_vocab)
+
+        all_nodes = {}
+        for row_idx in range(src.shape[0]):
+            this_row = src[row_idx, 0, :]
+            tok_idx = this_row[0]
+            if tok_vocab.itos[tok_idx] in ['_(', ')_']:
+                continue
+            elif tok_vocab.itos[tok_idx] in ['<unk>']:
+                # Why do we do it this way instead of looking it up in the
+                # src_vocab? Because we don't have the token, only an unk.
+                # find the column number of this row in the src_map
+                # TODO figure out why src_map has one map for each beam?
+                this_src_map = src_map[row_idx, 0, :]
+                # TODO is there a better way to do .index() in pytorch?
+                # https://stackoverflow.com/questions/47863001/how-pytorch-tensor-get-the-index-of-specific-value
+                src_sequence_idx = (this_src_map == 1).nonzero()[0][0].tolist()
+                # get the extended vocab idx of the unk token
+                tok_idx = src_sequence_idx + tok_vocab_size
+            conllu_id = id_vocab.itos[this_row[2]]
+            conllu_head = head_vocab.itos[this_row[3]]
+            if conllu_head in ['0']:
+                # We're at the root node
+                all_nodes[conllu_id] = Node(conllu_id, tok_idx=tok_idx)
+            else:
+                all_nodes[conllu_id] = Node(
+                    conllu_id, parent=all_nodes[conllu_head], tok_idx=tok_idx)
+        self._calc_descendent_counts(all_nodes['1'])
+        return all_nodes
+
+
+    def _calc_descendent_counts(self, node):
+        n = 0
+        for child_node in node.children:
+            n = n + 1 + self._calc_descendent_counts(child_node)
+        node.desc_count = n
+        return n
+
+
     def _get_src_counter(self, src_vocab, src, vocab_size):
         extended_vocab_count = Counter()
         for key, value in src_vocab.freqs.items():
@@ -598,6 +644,8 @@ class Translator(object):
         original_vocab_count = Counter(
             [tok for tok in src[:, 0, 0].tolist() if tok not in [0, 4, 5,]])
         total_count = extended_vocab_count + original_vocab_count
+        # Don't forget EOS
+        total_count += Counter([3])
         return total_count
 
     def _translate_batch(
@@ -648,6 +696,7 @@ class Translator(object):
         # TODO make this optional
         vocab_size = len(self.fields['src'].fields[0][1].vocab)
         src_counter = self._get_src_counter(src_vocabs[batch.indices[0]], src, vocab_size)
+        src_tree_nodes = self._get_src_tree(src, src_map)
 
         # (0) pt 2, prep the beam object
         beam = BeamSearch(
@@ -667,8 +716,11 @@ class Translator(object):
             block_ngram_repeat=self.block_ngram_repeat,
             exclusion_tokens=self._exclusion_idxs,
             memory_lengths=memory_lengths,
-            src_counter=src_counter)
+            src_counter=src_counter,
+            src_tree_nodes=src_tree_nodes,
+            src=src)
 
+        # import ipdb; ipdb.set_trace()
         for step in range(max_length):
             decoder_input = beam.current_predictions.view(1, -1, 1)
 

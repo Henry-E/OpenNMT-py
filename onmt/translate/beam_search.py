@@ -59,17 +59,18 @@ class BeamSearch(DecodeStrategy):
     def __init__(self, beam_size, batch_size, pad, bos, eos, n_best, mb_device,
                  global_scorer, min_length, max_length, return_attention,
                  block_ngram_repeat, exclusion_tokens, memory_lengths,
-                 stepwise_penalty, ratio, src_counter):
+                 stepwise_penalty, ratio, src_counter, src_tree_nodes, src):
         # import ipdb; ipdb.set_trace()
         # TODO make this optional
+        # src_tokens = [tok not  for tok in src[:, 0, 0].tolist() if tok not in [4, 5]]
         # ignore the scoping brackets
-        # src_tokens = [tok for tok in src[:, 0, 0].tolist() if tok not in [4, 5]]
-        # num_tokens = len(src_tokens)
+        num_tokens = sum(tok not in [4, 5] for tok in src[:, 0, 0].tolist())
 
-        # # min_length = num_tokens - 1
+        min_length = num_tokens
         # # max_length = num_tokens
         # # ratio = 1
         self.src_counter = src_counter
+        self.src_tree_nodes = src_tree_nodes
 
         super(BeamSearch, self).__init__(
             pad, bos, eos, batch_size, mb_device, beam_size, min_length,
@@ -142,10 +143,35 @@ class BeamSearch(DecodeStrategy):
             disallowed_token_idxs = [True] * log_probs.size(-1)
             for key in remaining_toks:
                 disallowed_token_idxs[key] = False
-            disallowed_lookup = torch.LongTensor(disallowed_token_idxs)
+            # https://discuss.pytorch.org/t/slicing-tensor-using-boolean-list/7354/5
+            disallowed_lookup = torch.Tensor(disallowed_token_idxs) == True
             log_probs[path_idx, disallowed_lookup] = -10e20
             # if any(this_counter - self.src_counter):
             #     log_probs[path_idx] = -10e20
+
+    def get_allowed_idxs(tree, nodes, so_far):
+        idx = 0
+        current_parent = None
+        done_labels = {}
+        while idx < len(so_far):
+            label = so_far[idx]
+            node = nodes[label]
+            if node.desc_count < len(so_far) - idx:
+                done_labels[label] = true
+                idx = idx + node.desc_count + 1
+            else:
+                current_parent = node
+                idx = idx + 1
+        allowed_nodes_mapping = {}
+        for child_node in current_parent.children:
+            import ipdb; ipdb.set_trace
+            # we're not sure what to call on the node to get the label
+            this_label = child_node.name
+            if done_labels[this_label]:
+                continue
+            allowed_nodes_mapping[child_node.tok_idx] = this_label
+        return allowed_nodes_mapping
+
 
     def advance(self, log_probs, attn):
         vocab_size = log_probs.size(-1)
@@ -167,6 +193,9 @@ class BeamSearch(DecodeStrategy):
         log_probs += self.topk_log_probs.view(_B * self.beam_size, 1)
 
         self.block_ngram_repeats(log_probs)
+        import ipdb; ipdb.set_trace()
+        # TODO make this optional because it's redundant when using tree node
+        # blocking
         self.restrict_repetition(log_probs)
 
         # if the sequence ends now, then the penalty is the current
