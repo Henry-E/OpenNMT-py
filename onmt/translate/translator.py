@@ -599,7 +599,7 @@ class Translator(object):
         all_nodes = {}
         for row_idx in range(src.shape[0]):
             this_row = src[row_idx, 0, :]
-            tok_idx = this_row[0]
+            tok_idx = this_row[0].tolist()
             if tok_vocab.itos[tok_idx] in ['_(', ')_']:
                 continue
             elif tok_vocab.itos[tok_idx] in ['<unk>']:
@@ -720,7 +720,6 @@ class Translator(object):
             src_tree_nodes=src_tree_nodes,
             src=src)
 
-        # import ipdb; ipdb.set_trace()
         for step in range(max_length):
             decoder_input = beam.current_predictions.view(1, -1, 1)
 

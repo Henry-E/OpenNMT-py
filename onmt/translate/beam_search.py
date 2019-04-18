@@ -1,6 +1,7 @@
 import torch
 
 from collections import Counter
+import copy
 
 from onmt.translate.decode_strategy import DecodeStrategy
 
@@ -71,6 +72,7 @@ class BeamSearch(DecodeStrategy):
         # # ratio = 1
         self.src_counter = src_counter
         self.src_tree_nodes = src_tree_nodes
+        self.conllu_ids_so_far = [[] for i in range(beam_size)]
 
         super(BeamSearch, self).__init__(
             pad, bos, eos, batch_size, mb_device, beam_size, min_length,
@@ -149,25 +151,92 @@ class BeamSearch(DecodeStrategy):
             # if any(this_counter - self.src_counter):
             #     log_probs[path_idx] = -10e20
 
-    def get_allowed_idxs(tree, nodes, so_far):
+    def mask_log_probs(self, log_probs, allowed_tokens, path_idx):
+        disallowed_token_idxs = [True] * log_probs.size(-1)
+        for key in allowed_tokens:
+            disallowed_token_idxs[key] = False
+        # EOS is masked later on
+        disallowed_token_idxs[3] = False
+        # https://discuss.pytorch.org/t/slicing-tensor-using-boolean-list/7354/5
+        disallowed_lookup = torch.Tensor(disallowed_token_idxs) == True
+        log_probs[path_idx, disallowed_lookup] = -10e20
+
+
+    def depth_first_decoding(self, log_probs):
+        # We're assuming that none of the beams will die before all tokens are
+        # generated and that they will all die at the same time. We can do this
+        # because we know exactly how many tokens there are and what specific
+        # tokens will appear
+        for path_idx in range(self.alive_seq.shape[0]):
+            current_step = self.alive_seq.size(-1)
+            if current_step == 1:
+                allowed_tokens = {self.src_tree_nodes['1'].tok_idx: '1'}
+                self.mask_log_probs(log_probs, allowed_tokens, path_idx)
+            elif current_step == 2:
+                self.conllu_ids_so_far[path_idx].append('1')
+                allowed_tokens = self.get_allowed_idxs(
+                    self.conllu_ids_so_far[path_idx])
+                self.mask_log_probs(log_probs, allowed_tokens, path_idx)
+            elif current_step > 2:
+                # We were having trouble with beams changes order so we need to
+                # keep track of what a beams history was in terms of conllu ids
+                # drop the most recent choice so we can match it
+                tok_history = self.alive_seq[path_idx, :-1]
+                # There has to be a more pytorch-y way of doing this
+                matching_rows = [
+                    i for i in range(self.alive_seq.shape[0])
+                    if all(tok_history == self.prev_alive_seq[i])
+                ]
+                self.conllu_ids_so_far[path_idx] = copy.copy(
+                    self.pre_conllu_ids_so_far[matching_rows[0]])
+                previously_allowed_tokens = self.get_allowed_idxs(
+                        self.conllu_ids_so_far[path_idx])
+                # we need to make sure this is converted to an int
+                chosen_hyp = self.alive_seq[path_idx, -1].tolist()
+                try:
+                    chosen_conllu_id = previously_allowed_tokens[chosen_hyp]
+                    self.conllu_ids_so_far[path_idx].append(chosen_conllu_id)
+                except:
+                    # We expect it to fail but still not sure why
+                    # print('well ok it did that thing')
+                    # print(self.src_tree_nodes)
+                    pass
+                allowed_tokens = self.get_allowed_idxs(
+                        self.conllu_ids_so_far[path_idx])
+                self.mask_log_probs(log_probs, allowed_tokens, path_idx)
+        # make copies of the previous variables
+        self.prev_alive_seq = self.alive_seq.clone()
+        self.pre_conllu_ids_so_far = copy.deepcopy(self.conllu_ids_so_far)
+        # print(log_probs)
+        # print(log_probs.exp())
+        # print(self.alive_seq)
+        # print(self.conllu_ids_so_far)
+        # import ipdb; ipdb.set_trace()
+        # pass
+
+
+    def get_allowed_idxs(self, so_far):
         idx = 0
-        current_parent = None
+        # Set default parent to root node as sometimes there are no children
+        current_parent = self.src_tree_nodes['1']
         done_labels = {}
         while idx < len(so_far):
             label = so_far[idx]
-            node = nodes[label]
+            node = self.src_tree_nodes[label]
             if node.desc_count < len(so_far) - idx:
-                done_labels[label] = true
+                done_labels[label] = True
                 idx = idx + node.desc_count + 1
             else:
                 current_parent = node
                 idx = idx + 1
         allowed_nodes_mapping = {}
+        # Note: If two child nodes have the same token vocab index then it's
+        # impossible to tell which was chosen by the model. So we just have to
+        # do it randomly. We still have to check how frequently this occurs but
+        # it ought to be rare.
         for child_node in current_parent.children:
-            import ipdb; ipdb.set_trace
-            # we're not sure what to call on the node to get the label
             this_label = child_node.name
-            if done_labels[this_label]:
+            if this_label in done_labels:
                 continue
             allowed_nodes_mapping[child_node.tok_idx] = this_label
         return allowed_nodes_mapping
@@ -193,10 +262,11 @@ class BeamSearch(DecodeStrategy):
         log_probs += self.topk_log_probs.view(_B * self.beam_size, 1)
 
         self.block_ngram_repeats(log_probs)
-        import ipdb; ipdb.set_trace()
         # TODO make this optional because it's redundant when using tree node
         # blocking
         self.restrict_repetition(log_probs)
+        # import ipdb; ipdb.set_trace()
+        self.depth_first_decoding(log_probs)
 
         # if the sequence ends now, then the penalty is the current
         # length + 1, to include the EOS token
@@ -338,3 +408,4 @@ class BeamSearch(DecodeStrategy):
                 if self._stepwise_cov_pen:
                     self._prev_penalty = self._prev_penalty.index_select(
                         0, non_finished)
+
