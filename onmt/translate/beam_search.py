@@ -1,9 +1,9 @@
 import torch
 
-from collections import Counter
-import copy
+from collections import Counter, defaultdict, deque, namedtuple
 
 from onmt.translate.decode_strategy import DecodeStrategy
+
 
 
 
@@ -60,19 +60,36 @@ class BeamSearch(DecodeStrategy):
     def __init__(self, beam_size, batch_size, pad, bos, eos, n_best, mb_device,
                  global_scorer, min_length, max_length, return_attention,
                  block_ngram_repeat, exclusion_tokens, memory_lengths,
-                 stepwise_penalty, ratio, src_counter, src_tree_nodes, src):
-        # import ipdb; ipdb.set_trace()
-        # TODO make this optional
+                 stepwise_penalty, ratio, conllu_ids, tok_idxs):
         # src_tokens = [tok not  for tok in src[:, 0, 0].tolist() if tok not in [4, 5]]
         # ignore the scoping brackets
-        num_tokens = sum(tok not in [4, 5] for tok in src[:, 0, 0].tolist())
+        # num_tokens = sum(tok not in [4, 5] for tok in src[:, 0, 0].tolist())
 
-        min_length = num_tokens
+        min_length = len(set(conllu_ids))
+        max_length = min_length
         # # max_length = num_tokens
         # # ratio = 1
-        self.src_counter = src_counter
-        self.src_tree_nodes = src_tree_nodes
-        self.conllu_ids_so_far = [[] for i in range(beam_size)]
+        # self.src_counter = src_counter
+        # self.src_tree_nodes = src_tree_nodes
+
+        # get edges using conllu ids and vocab idxs
+        # TODO do the tok_idxs work better as strings?
+        self.edges = self.get_edges(conllu_ids, tok_idxs)
+        # self.vocab_idxs
+        self.tok_idxs = tok_idxs
+        self.conllu_ids = conllu_ids
+        # There's no suggestions is the conllu_ids length is the same, in this
+        # case we can just use a simple counter to restrict repetition
+        self.no_suggestions = len(conllu_ids) == min_length
+        self.src_counter = Counter(tok_idxs + [3])
+        # store the vocab_idxs so far instead? Well we don't have to since
+        # we already keep that information as part of the hypothesis right?
+        # make a self dictionary for the states so that we can look up
+        # states using the hypotheses as input, right? just init a dict
+        self.MatchState = namedtuple('State', ['rm', 'cm', 'allowed', 'count'])
+        self.states = {}
+        self.valid_hyps = {}
+        # self.conllu_ids_so_far = [[] for i in range(beam_size)]
 
         super(BeamSearch, self).__init__(
             pad, bos, eos, batch_size, mb_device, beam_size, min_length,
@@ -135,26 +152,141 @@ class BeamSearch(DecodeStrategy):
         return self.select_indices.view(self.batch_size, self.beam_size)\
             .fmod(self.beam_size)
 
-    def restrict_repetition(self, log_probs):
+
+    def get_edges(self, nums, letters):
+        edge_dict = defaultdict(lambda: [])
+        for num, letter in zip(nums, letters):
+            edge_dict[letter].append(num)
+        return [edge_dict[letter] for letter in letters]
+
+
+    def find_match(self, edges, rm, cm, src, mutate=False):
+        frm = {}
+        frm[src] = src
+        q = deque()
+        q.append(src)
+        found = False
+        while q and not found:
+            where = q.popleft()
+            for match in edges[where]:
+                nxt = cm[match]
+                if where != nxt:
+                    if nxt is None:
+                        found = True
+                        break
+                    if nxt not in frm:
+                        q.append(nxt)
+                        frm[nxt] = where
+        if mutate and found:
+            while frm[where] != where:
+                tmp = rm[where]
+                rm[where] = match
+                cm[match] = where
+                where = frm[where]
+                match = tmp
+            rm[where] = match
+        return found
+
+
+    def find_succs(self, sofar, state=None):
+        edges = self.edges
+        letters = self.tok_idxs
+        N = len(edges)
+        if state is None:
+            state = self.MatchState([None] * N, [None] * N, [True] * N, [0])
+        rm = state.rm
+        cm = state.cm
+        allowed = state.allowed
+        count = state.count
+        for idx in range(count[0], len(sofar)):
+            used = sofar[idx]
+            for x, letter in enumerate(letters):
+                if letter == used and allowed[x]:
+                    assert self.find_match(edges, rm, cm, x, True)
+                    count[0] += 1
+                    allowed[x] = False
+                    break
+        assert count[0] == len(sofar)
+        ret = set()
+        for x in range(N):
+            if allowed[x] and letters[x] not in ret:
+                if self.find_match(edges, rm, cm, x):
+                    ret.add(letters[x])
+                else:
+                    allowed[x] = False
+        return (list(ret), state)
+
+
+    def basic_restrict_repetition(self, log_probs):
         for path_idx in range(self.alive_seq.shape[0]):
-            # skip BOS
+            # Simpler restricted repetition
             hyp = self.alive_seq[path_idx, 1:]
             this_counter = Counter(hyp.tolist())
             remaining_toks = self.src_counter - this_counter
-            # make list of length vocab size
-            disallowed_token_idxs = [True] * log_probs.size(-1)
-            for key in remaining_toks:
-                disallowed_token_idxs[key] = False
-            # https://discuss.pytorch.org/t/slicing-tensor-using-boolean-list/7354/5
-            disallowed_lookup = torch.Tensor(disallowed_token_idxs) == True
-            log_probs[path_idx, disallowed_lookup] = -10e20
-            # if any(this_counter - self.src_counter):
-            #     log_probs[path_idx] = -10e20
+            self.mask_log_probs(log_probs, remaining_toks, path_idx)
+
+
+    def restrict_repetition(self, log_probs):
+        for path_idx in range(self.alive_seq.shape[0]):
+            # Simpler restricted repetition if no form suggestions
+            if self.no_suggestions:
+                hyp = self.alive_seq[path_idx, 1:]
+                this_counter = Counter(hyp.tolist())
+                remaining_toks = self.src_counter - this_counter
+                self.mask_log_probs(log_probs, remaining_toks, path_idx)
+                continue
+            current_step = self.alive_seq.size(-1)
+            if current_step == 1:
+                allowed_idxs = set(self.tok_idxs)
+                self.mask_log_probs(log_probs, allowed_idxs, path_idx)
+            elif current_step == 2:
+                hyp = self.alive_seq[path_idx, 1:].tolist()
+                # this is an indication that we diverged already from the
+                # allowed list of tokens, possibly due to small sentence length
+                # Have to use 1 because idx might be [0] which evals to false
+                if any(1 for idx in hyp if idx not in self.tok_idxs):
+                    allowed_idxs = []
+                else:
+                    allowed_idxs, this_state = self.find_succs(hyp)
+                    self.states[str(hyp[0])] = this_state
+                    self.valid_hyps[str(hyp[0])] = allowed_idxs
+                self.mask_log_probs(log_probs, allowed_idxs, path_idx)
+            elif current_step > 2:
+                hyp = self.alive_seq[path_idx, 1:].tolist()
+                prev_hyp = ','.join([str(i) for i in hyp[:-1]])
+                # make sure that it generated a valid idx
+                if prev_hyp not in self.valid_hyps or \
+                        hyp[-1] not in self.valid_hyps[prev_hyp]:
+                    allowed_idxs = []
+                else:
+                    prev_state = self.states[prev_hyp]
+                    allowed_idxs, this_state = self.find_succs(hyp, prev_state)
+                    this_hyp = ','.join([str(i) for i in hyp])
+                    self.states[this_hyp] = this_state
+                    self.valid_hyps[this_hyp] = allowed_idxs
+                self.mask_log_probs(log_probs, allowed_idxs, path_idx)
+
+
+    # def restrict_repetition(self, log_probs):
+    #     for path_idx in range(self.alive_seq.shape[0]):
+    #         # skip BOS
+    #         hyp = self.alive_seq[path_idx, 1:]
+    #         this_counter = Counter(hyp.tolist())
+    #         remaining_toks = self.src_counter - this_counter
+    #         # make list of length vocab size
+    #         disallowed_token_idxs = [True] * log_probs.size(-1)
+    #         for key in remaining_toks:
+    #             disallowed_token_idxs[key] = False
+    #         # https://discuss.pytorch.org/t/slicing-tensor-using-boolean-list/7354/5
+    #         disallowed_lookup = torch.Tensor(disallowed_token_idxs) == True
+    #         log_probs[path_idx, disallowed_lookup] = -10e20
+    #         # if any(this_counter - self.src_counter):
+    #         #     log_probs[path_idx] = -10e20
 
     def mask_log_probs(self, log_probs, allowed_tokens, path_idx):
         disallowed_token_idxs = [True] * log_probs.size(-1)
-        for key in allowed_tokens:
-            disallowed_token_idxs[key] = False
+        for tok_idx in allowed_tokens:
+            disallowed_token_idxs[tok_idx] = False
         # EOS is masked later on
         disallowed_token_idxs[3] = False
         # https://discuss.pytorch.org/t/slicing-tensor-using-boolean-list/7354/5
@@ -162,84 +294,84 @@ class BeamSearch(DecodeStrategy):
         log_probs[path_idx, disallowed_lookup] = -10e20
 
 
-    def depth_first_decoding(self, log_probs):
-        # We're assuming that none of the beams will die before all tokens are
-        # generated and that they will all die at the same time. We can do this
-        # because we know exactly how many tokens there are and what specific
-        # tokens will appear
-        for path_idx in range(self.alive_seq.shape[0]):
-            current_step = self.alive_seq.size(-1)
-            if current_step == 1:
-                allowed_tokens = {self.src_tree_nodes['1'].tok_idx: '1'}
-                self.mask_log_probs(log_probs, allowed_tokens, path_idx)
-            elif current_step == 2:
-                self.conllu_ids_so_far[path_idx].append('1')
-                allowed_tokens = self.get_allowed_idxs(
-                    self.conllu_ids_so_far[path_idx])
-                self.mask_log_probs(log_probs, allowed_tokens, path_idx)
-            elif current_step > 2:
-                # We were having trouble with beams changes order so we need to
-                # keep track of what a beams history was in terms of conllu ids
-                # drop the most recent choice so we can match it
-                tok_history = self.alive_seq[path_idx, :-1]
-                # There has to be a more pytorch-y way of doing this
-                matching_rows = [
-                    i for i in range(self.alive_seq.shape[0])
-                    if all(tok_history == self.prev_alive_seq[i])
-                ]
-                self.conllu_ids_so_far[path_idx] = copy.copy(
-                    self.pre_conllu_ids_so_far[matching_rows[0]])
-                previously_allowed_tokens = self.get_allowed_idxs(
-                        self.conllu_ids_so_far[path_idx])
-                # we need to make sure this is converted to an int
-                chosen_hyp = self.alive_seq[path_idx, -1].tolist()
-                try:
-                    chosen_conllu_id = previously_allowed_tokens[chosen_hyp]
-                    self.conllu_ids_so_far[path_idx].append(chosen_conllu_id)
-                except:
-                    # We expect it to fail but still not sure why
-                    # print('well ok it did that thing')
-                    # print(self.src_tree_nodes)
-                    pass
-                allowed_tokens = self.get_allowed_idxs(
-                        self.conllu_ids_so_far[path_idx])
-                self.mask_log_probs(log_probs, allowed_tokens, path_idx)
-        # make copies of the previous variables
-        self.prev_alive_seq = self.alive_seq.clone()
-        self.pre_conllu_ids_so_far = copy.deepcopy(self.conllu_ids_so_far)
-        # print(log_probs)
-        # print(log_probs.exp())
-        # print(self.alive_seq)
-        # print(self.conllu_ids_so_far)
-        # import ipdb; ipdb.set_trace()
-        # pass
+    # def depth_first_decoding(self, log_probs):
+    #     # We're assuming that none of the beams will die before all tokens are
+    #     # generated and that they will all die at the same time. We can do this
+    #     # because we know exactly how many tokens there are and what specific
+    #     # tokens will appear
+    #     for path_idx in range(self.alive_seq.shape[0]):
+    #         current_step = self.alive_seq.size(-1)
+    #         if current_step == 1:
+    #             allowed_tokens = {self.src_tree_nodes['1'].tok_idx: '1'}
+    #             self.mask_log_probs(log_probs, allowed_tokens, path_idx)
+    #         elif current_step == 2:
+    #             self.conllu_ids_so_far[path_idx].append('1')
+    #             allowed_tokens = self.get_allowed_idxs(
+    #                 self.conllu_ids_so_far[path_idx])
+    #             self.mask_log_probs(log_probs, allowed_tokens, path_idx)
+    #         elif current_step > 2:
+    #             # We were having trouble with beams changes order so we need to
+    #             # keep track of what a beams history was in terms of conllu ids
+    #             # drop the most recent choice so we can match it
+    #             tok_history = self.alive_seq[path_idx, :-1]
+    #             # There has to be a more pytorch-y way of doing this
+    #             matching_rows = [
+    #                 i for i in range(self.alive_seq.shape[0])
+    #                 if all(tok_history == self.prev_alive_seq[i])
+    #             ]
+    #             self.conllu_ids_so_far[path_idx] = copy.copy(
+    #                 self.pre_conllu_ids_so_far[matching_rows[0]])
+    #             previously_allowed_tokens = self.get_allowed_idxs(
+    #                     self.conllu_ids_so_far[path_idx])
+    #             # we need to make sure this is converted to an int
+    #             chosen_hyp = self.alive_seq[path_idx, -1].tolist()
+    #             try:
+    #                 chosen_conllu_id = previously_allowed_tokens[chosen_hyp]
+    #                 self.conllu_ids_so_far[path_idx].append(chosen_conllu_id)
+    #             except:
+    #                 # We expect it to fail but still not sure why
+    #                 # print('well ok it did that thing')
+    #                 # print(self.src_tree_nodes)
+    #                 pass
+    #             allowed_tokens = self.get_allowed_idxs(
+    #                 self.conllu_ids_so_far[path_idx])
+    #             self.mask_log_probs(log_probs, allowed_tokens, path_idx)
+    #     # make copies of the previous variables
+    #     self.prev_alive_seq = self.alive_seq.clone()
+    #     self.pre_conllu_ids_so_far = copy.deepcopy(self.conllu_ids_so_far)
+    #     # print(log_probs)
+    #     # print(log_probs.exp())
+    #     # print(self.alive_seq)
+    #     # print(self.conllu_ids_so_far)
+    #     # import ipdb; ipdb.set_trace()
+    #     # pass
 
 
-    def get_allowed_idxs(self, so_far):
-        idx = 0
-        # Set default parent to root node as sometimes there are no children
-        current_parent = self.src_tree_nodes['1']
-        done_labels = {}
-        while idx < len(so_far):
-            label = so_far[idx]
-            node = self.src_tree_nodes[label]
-            if node.desc_count < len(so_far) - idx:
-                done_labels[label] = True
-                idx = idx + node.desc_count + 1
-            else:
-                current_parent = node
-                idx = idx + 1
-        allowed_nodes_mapping = {}
-        # Note: If two child nodes have the same token vocab index then it's
-        # impossible to tell which was chosen by the model. So we just have to
-        # do it randomly. We still have to check how frequently this occurs but
-        # it ought to be rare.
-        for child_node in current_parent.children:
-            this_label = child_node.name
-            if this_label in done_labels:
-                continue
-            allowed_nodes_mapping[child_node.tok_idx] = this_label
-        return allowed_nodes_mapping
+    # def get_allowed_idxs(self, so_far):
+    #     idx = 0
+    #     # Set default parent to root node as sometimes there are no children
+    #     current_parent = self.src_tree_nodes['1']
+    #     done_labels = {}
+    #     while idx < len(so_far):
+    #         label = so_far[idx]
+    #         node = self.src_tree_nodes[label]
+    #         if node.desc_count < len(so_far) - idx:
+    #             done_labels[label] = True
+    #             idx = idx + node.desc_count + 1
+    #         else:
+    #             current_parent = node
+    #             idx = idx + 1
+    #     allowed_nodes_mapping = {}
+    #     # Note: If two child nodes have the same token vocab index then it's
+    #     # impossible to tell which was chosen by the model. So we just have to
+    #     # do it randomly. We still have to check how frequently this occurs but
+    #     # it ought to be rare.
+    #     for child_node in current_parent.children:
+    #         this_label = child_node.name
+    #         if this_label in done_labels:
+    #             continue
+    #         allowed_nodes_mapping[child_node.tok_idx] = this_label
+    #     return allowed_nodes_mapping
 
 
     def advance(self, log_probs, attn):
@@ -251,8 +383,8 @@ class BeamSearch(DecodeStrategy):
         if self._stepwise_cov_pen and self._prev_penalty is not None:
             self.topk_log_probs += self._prev_penalty
             self.topk_log_probs -= self.global_scorer.cov_penalty(
-                self._coverage + attn, self.global_scorer.beta).view(
-                _B, self.beam_size)
+                self._coverage + attn,
+                self.global_scorer.beta).view(_B, self.beam_size)
 
         # force the output to be longer than self.min_length
         step = len(self)
@@ -261,12 +393,11 @@ class BeamSearch(DecodeStrategy):
         # Multiply probs by the beam probability.
         log_probs += self.topk_log_probs.view(_B * self.beam_size, 1)
 
-        self.block_ngram_repeats(log_probs)
-        # TODO make this optional because it's redundant when using tree node
-        # blocking
-        self.restrict_repetition(log_probs)
-        # import ipdb; ipdb.set_trace()
-        self.depth_first_decoding(log_probs)
+        # self.block_ngram_repeats(log_probs)
+        if self.block_ngram_repeat in [1]:
+            self.restrict_repetition(log_probs)
+        elif self.block_ngram_repeat in [2]:
+            self.basic_restrict_repetition(log_probs)
 
         # if the sequence ends now, then the penalty is the current
         # length + 1, to include the EOS token
@@ -276,7 +407,9 @@ class BeamSearch(DecodeStrategy):
         # Flatten probs into a list of possibilities.
         curr_scores = log_probs / length_penalty
         curr_scores = curr_scores.reshape(_B, self.beam_size * vocab_size)
-        torch.topk(curr_scores,  self.beam_size, dim=-1,
+        torch.topk(curr_scores,
+                   self.beam_size,
+                   dim=-1,
                    out=(self.topk_scores, self.topk_ids))
 
         # Recover log probs.
@@ -408,4 +541,3 @@ class BeamSearch(DecodeStrategy):
                 if self._stepwise_cov_pen:
                     self._prev_penalty = self._prev_penalty.index_select(
                         0, non_finished)
-

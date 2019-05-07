@@ -19,8 +19,6 @@ from onmt.translate.random_sampling import RandomSampling
 from onmt.utils.misc import tile, set_random_seed
 from onmt.modules.copy_generator import collapse_copy_scores
 
-from anytree import Node
-
 
 def build_translator(opt, report_score=True, logger=None, out_file=None):
     if out_file is None:
@@ -633,6 +631,34 @@ class Translator(object):
         return all_nodes
 
 
+    def _get_src_ids(self, src, src_map):
+        tok_vocab = self.fields['src'].fields[0][1].vocab
+        id_vocab = self.fields['src'].fields[2][1].vocab
+        tok_vocab_size = len(tok_vocab)
+
+        conllu_ids = []
+        tok_idxs = []
+        for row_idx in range(src.shape[0]):
+            this_row = src[row_idx, 0, :]
+            tok_idx = this_row[0].tolist()
+            if tok_vocab.itos[tok_idx] in ['_(', ')_', '_form_suggestions_']:
+                continue
+            elif tok_vocab.itos[tok_idx] in ['<unk>']:
+                # Why do we do it this way instead of looking it up in the
+                # src_vocab? Because we don't have the token, only an unk.
+                # find the column number of this row in the src_map
+                this_src_map = src_map[row_idx, 0, :]
+                # is there a better way to do .index() in pytorch?
+                # https://stackoverflow.com/questions/47863001/how-pytorch-tensor-get-the-index-of-specific-value
+                src_sequence_idx = (this_src_map == 1).nonzero()[0][0].tolist()
+                # get the extended vocab idx of the unk token
+                tok_idx = src_sequence_idx + tok_vocab_size
+            tok_idxs.append(tok_idx)
+            conllu_id = id_vocab.itos[this_row[2]]
+            conllu_ids.append(int(conllu_id))
+        return conllu_ids, tok_idxs
+
+
     def _calc_descendent_counts(self, node):
         n = 0
         for child_node in node.children:
@@ -703,30 +729,30 @@ class Translator(object):
 
         # TODO make this optional
         vocab_size = len(self.fields['src'].fields[0][1].vocab)
-        src_counter = self._get_src_counter(src_vocabs[batch.indices[0]], src, vocab_size)
-        src_tree_nodes = self._get_src_tree(src, src_map)
+        # src_counter = self._get_src_counter(src_vocabs[batch.indices[0]], src,
+        #                                     vocab_size)
+        # src_tree_nodes = self._get_src_tree(src, src_map)
+        conllu_ids, tok_idxs = self._get_src_ids(src, src_map)
 
         # (0) pt 2, prep the beam object
-        beam = BeamSearch(
-            beam_size,
-            n_best=n_best,
-            batch_size=batch_size,
-            global_scorer=self.global_scorer,
-            pad=self._tgt_pad_idx,
-            eos=self._tgt_eos_idx,
-            bos=self._tgt_bos_idx,
-            min_length=min_length,
-            ratio=ratio,
-            max_length=max_length,
-            mb_device=mb_device,
-            return_attention=return_attention,
-            stepwise_penalty=self.stepwise_penalty,
-            block_ngram_repeat=self.block_ngram_repeat,
-            exclusion_tokens=self._exclusion_idxs,
-            memory_lengths=memory_lengths,
-            src_counter=src_counter,
-            src_tree_nodes=src_tree_nodes,
-            src=src)
+        beam = BeamSearch(beam_size,
+                          n_best=n_best,
+                          batch_size=batch_size,
+                          global_scorer=self.global_scorer,
+                          pad=self._tgt_pad_idx,
+                          eos=self._tgt_eos_idx,
+                          bos=self._tgt_bos_idx,
+                          min_length=min_length,
+                          ratio=ratio,
+                          max_length=max_length,
+                          mb_device=mb_device,
+                          return_attention=return_attention,
+                          stepwise_penalty=self.stepwise_penalty,
+                          block_ngram_repeat=self.block_ngram_repeat,
+                          exclusion_tokens=self._exclusion_idxs,
+                          memory_lengths=memory_lengths,
+                          conllu_ids=conllu_ids,
+                          tok_idxs=tok_idxs)
 
         for step in range(max_length):
             decoder_input = beam.current_predictions.view(1, -1, 1)
