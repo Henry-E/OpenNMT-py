@@ -6,7 +6,7 @@ import os
 import math
 import time
 from itertools import count
-from collections import Counter
+from collections import Counter, defaultdict, deque
 
 import torch
 
@@ -682,6 +682,63 @@ class Translator(object):
         total_count += Counter([3])
         return total_count
 
+
+    def get_edges(self, nums, letters):
+        edge_dict = defaultdict(lambda: [])
+        for num, letter in zip(nums, letters):
+            edge_dict[letter].append(num)
+        return [edge_dict[letter] for letter in letters]
+
+
+    def find_match(self, edges, rm, cm, src):
+        frm = [None] * len(rm)
+        frm[src] = src
+        q = deque()
+        q.append(src)
+        found = False
+        while q and not found:
+            where = q.popleft()
+            for match in edges[where]:
+                nxt = cm[match]
+                if where != nxt:
+                    if nxt is None:
+                        found = True
+                        break
+                    if frm[nxt] is None:
+                        q.append(nxt)
+                        frm[nxt] = where
+        if not found:
+            return False
+        while frm[where] != where:
+            tmp = rm[where]
+            rm[where] = match
+            cm[match] = where
+            where = frm[where]
+            match = tmp
+        rm[where] = match
+        cm[match] = where
+        return True
+
+
+    def match_valid(self, edges, letters, sofar):
+        N = len(edges)
+        rm = [None] * N
+        cm = [None] * N
+        allowed = [True] * N
+        for used in sofar:
+            found = False
+            for x, letter in enumerate(letters):
+                if letter == used and allowed[x]:
+                    if not self.find_match(edges, rm, cm, x):
+                        return False
+                    found = True
+                    allowed[x] = False
+                    break
+            if not found:
+                return False
+        return True
+
+
     def _translate_batch(
             self,
             batch,
@@ -792,6 +849,31 @@ class Translator(object):
             self.model.decoder.map_state(
                 lambda state, dim: state.index_select(dim, select_indices))
 
+        edges = self.get_edges(conllu_ids, tok_idxs)
+        idxs_to_ignore = []
+        preds = [this.tolist() for this in beam.predictions[0]]
+        num_ids = len(set(conllu_ids))
+        no_suggestions = len(conllu_ids) == num_ids
+        for i, pred in enumerate(preds):
+            pred_len = len(pred)
+            # it's possible a shorter hyp may have slipped through
+            if no_suggestions or pred_len < num_ids:
+                continue
+            # TODO add a proper check when there's no alternatives that the ids
+            # have been properly covered in the beams
+            if pred_len < 2:
+                continue
+            # TODO add a proper check for sentences of length 1
+            is_valid = self.match_valid(edges, tok_idxs, pred)
+            if is_valid:
+                continue
+            idxs_to_ignore.append(i)
+        # we add an extra check that if all of them are bad, then just output
+        # whatever
+        if len(preds) != len(idxs_to_ignore):
+            # it seems to work fine if we just remove the predictions
+            for idx in idxs_to_ignore:
+                beam.predictions[0][idx] = []
         results["scores"] = beam.scores
         results["predictions"] = beam.predictions
         results["attention"] = beam.attention
