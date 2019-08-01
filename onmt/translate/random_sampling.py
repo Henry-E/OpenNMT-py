@@ -1,4 +1,5 @@
 import torch
+from collections import Counter
 
 from onmt.translate.decode_strategy import DecodeStrategy
 
@@ -86,7 +87,14 @@ class RandomSampling(DecodeStrategy):
     def __init__(self, pad, bos, eos, batch_size, device,
                  min_length, block_ngram_repeat, exclusion_tokens,
                  return_attention, max_length, sampling_temp, keep_topk,
-                 memory_length):
+                 memory_length, conllu_ids, tok_idxs):
+        # All the restrict repetition bits
+        min_length = len(set(conllu_ids))
+        max_length = min_length
+        self.tok_idxs = tok_idxs
+        self.conllu_ids = conllu_ids
+        self.src_counter = Counter(tok_idxs + [3])
+
         super(RandomSampling, self).__init__(
             pad, bos, eos, batch_size, device, 1,
             min_length, block_ngram_repeat, exclusion_tokens,
@@ -100,6 +108,27 @@ class RandomSampling(DecodeStrategy):
                                            dtype=torch.long, device=device)
         self.original_batch_idx = torch.arange(self.batch_size,
                                                dtype=torch.long, device=device)
+
+
+    def mask_log_probs(self, log_probs, allowed_tokens, path_idx):
+        disallowed_token_idxs = [True] * log_probs.size(-1)
+        for tok_idx in allowed_tokens:
+            disallowed_token_idxs[tok_idx] = False
+        # EOS is masked later on
+        disallowed_token_idxs[3] = False
+        # https://discuss.pytorch.org/t/slicing-tensor-using-boolean-list/7354/5
+        disallowed_lookup = torch.Tensor(disallowed_token_idxs) == True
+        log_probs[path_idx, disallowed_lookup] = -10e20
+
+
+    def basic_restrict_repetition(self, log_probs):
+        for path_idx in range(self.alive_seq.shape[0]):
+            # Simpler restricted repetition
+            hyp = self.alive_seq[path_idx, 1:]
+            this_counter = Counter(hyp.tolist())
+            remaining_toks = self.src_counter - this_counter
+            self.mask_log_probs(log_probs, remaining_toks, path_idx)
+
 
     def advance(self, log_probs, attn):
         """Select next tokens randomly from the top k possible next tokens.
@@ -115,7 +144,8 @@ class RandomSampling(DecodeStrategy):
         """
 
         self.ensure_min_length(log_probs)
-        self.block_ngram_repeats(log_probs)
+        self.basic_restrict_repetition(log_probs)
+        # self.block_ngram_repeats(log_probs)
         topk_ids, self.topk_scores = sample_with_temperature(
             log_probs, self.sampling_temp, self.keep_topk)
 

@@ -450,11 +450,15 @@ class Translator(object):
         else:
             mb_device = memory_bank.device
 
+        # get the stuff need for restricted decoding
+        conllu_ids, tok_idxs = self._get_src_ids(src, src_map)
+
         random_sampler = RandomSampling(
             self._tgt_pad_idx, self._tgt_bos_idx, self._tgt_eos_idx,
             batch_size, mb_device, min_length, self.block_ngram_repeat,
             self._exclusion_idxs, return_attention, self.max_length,
-            sampling_temp, keep_topk, memory_lengths)
+            sampling_temp, keep_topk, memory_lengths,
+            conllu_ids=conllu_ids, tok_idxs=tok_idxs)
 
         for step in range(max_length):
             # Shape: (1, B, 1)
