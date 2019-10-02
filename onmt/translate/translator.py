@@ -388,12 +388,12 @@ class Translator(object):
                 msg = self._report_score('GOLD', gold_score_total,
                                          gold_words_total)
                 self._log(msg)
-                if self.report_bleu:
-                    msg = self._report_bleu(tgt)
-                    self._log(msg)
-                if self.report_rouge:
-                    msg = self._report_rouge(tgt)
-                    self._log(msg)
+                # if self.report_bleu:
+                #     msg = self._report_bleu(tgt)
+                #     self._log(msg)
+                # if self.report_rouge:
+                #     msg = self._report_rouge(tgt)
+                #     self._log(msg)
 
         if self.report_time:
             total_time = end_time - start_time
@@ -657,8 +657,13 @@ class Translator(object):
                 src_sequence_idx = (this_src_map == 1).nonzero()[0][0].tolist()
                 # get the extended vocab idx of the unk token
                 tok_idx = src_sequence_idx + tok_vocab_size
-            tok_idxs.append(tok_idx)
+            # TODO there's an issue with the unk vocabthat form suggestions
+            # slips in 
             conllu_id = id_vocab.itos[this_row[2]]
+            # We ran into a single case of an unk in the conllu ids
+            if conllu_id in ['_', '<unk>']:
+                continue
+            tok_idxs.append(tok_idx)
             conllu_ids.append(int(conllu_id))
         return conllu_ids, tok_idxs
 
@@ -858,22 +863,31 @@ class Translator(object):
         preds = [this.tolist() for this in beam.predictions[0]]
         num_ids = len(set(conllu_ids))
         no_suggestions = len(conllu_ids) == num_ids
+        src_counter = Counter(tok_idxs)
         for i, pred in enumerate(preds):
             pred_len = len(pred)
+            pred_counter = Counter(pred)
+            # This means stuff appears in pred that shouldn't
+            if pred_counter - src_counter:
+                idxs_to_ignore.append(i)
+                continue
+            # no suggestions means don't need to check with match
+            if no_suggestions:
+                continue
             # it's possible a shorter hyp may have slipped through
-            if no_suggestions or pred_len < num_ids:
+            if pred_len < num_ids:
+                idxs_to_ignore.append(i)
                 continue
-            # TODO add a proper check when there's no alternatives that the ids
-            # have been properly covered in the beams
-            if pred_len < 2:
-                continue
-            # TODO add a proper check for sentences of length 1
+            # if pred_len < 2:
+            #     continue
             is_valid = self.match_valid(edges, tok_idxs, pred)
             if is_valid:
                 continue
             idxs_to_ignore.append(i)
         # we add an extra check that if all of them are bad, then just output
         # whatever
+        # TODO make an option to not output values if nothing satisfies, just
+        # when we need to use it to train the model
         if len(preds) != len(idxs_to_ignore):
             # it seems to work fine if we just remove the predictions
             for idx in idxs_to_ignore:
