@@ -541,3 +541,4 @@ class BeamSearch(DecodeStrategy):
                 if self._stepwise_cov_pen:
                     self._prev_penalty = self._prev_penalty.index_select(
                         0, non_finished)
+
