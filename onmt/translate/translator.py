@@ -6,6 +6,7 @@ import os
 import math
 import time
 from itertools import count
+from collections import Counter, defaultdict, deque
 
 import torch
 
@@ -428,8 +429,160 @@ class Translator(object):
                       codecs.open(self.dump_beam, 'w', 'utf-8'))
         return all_scores, all_predictions
 
+
+    def _get_src_tree(self, src, src_map):
+        tok_vocab = self.fields['src'].fields[0][1].vocab
+        id_vocab = self.fields['src'].fields[2][1].vocab
+        head_vocab = self.fields['src'].fields[3][1].vocab
+        tok_vocab_size = len(tok_vocab)
+        all_nodes = {}
+        for row_idx in range(src.shape[0]):
+            this_row = src[row_idx, 0, :]
+            tok_idx = this_row[0].tolist()
+            if tok_vocab.itos[tok_idx] in ['_(', ')_']:
+                continue
+            elif tok_vocab.itos[tok_idx] in ['<unk>']:
+                # Why do we do it this way instead of looking it up in the
+                # src_vocab? Because we don't have the token, only an unk.
+                # find the column number of this row in the src_map
+                # TODO figure out why src_map has one map for each beam?
+                this_src_map = src_map[row_idx, 0, :]
+                # TODO is there a better way to do .index() in pytorch?
+                # https://stackoverflow.com/questions/47863001/how-pytorch-tensor-get-the-index-of-specific-value
+                src_sequence_idx = (this_src_map == 1).nonzero()[0][0].tolist()
+                # get the extended vocab idx of the unk token
+                tok_idx = src_sequence_idx + tok_vocab_size
+            conllu_id = id_vocab.itos[this_row[2]]
+            conllu_head = head_vocab.itos[this_row[3]]
+            if conllu_head in ['0']:
+                # We're at the root node
+                all_nodes[conllu_id] = Node(conllu_id, tok_idx=tok_idx)
+            else:
+                all_nodes[conllu_id] = Node(
+                    conllu_id, parent=all_nodes[conllu_head], tok_idx=tok_idx)
+        self._calc_descendent_counts(all_nodes['1'])
+        return all_nodes
+
+
+    def _get_src_ids(self, src, src_map):
+        tok_vocab = self.fields['src'].fields[0][1].vocab
+        id_vocab = self.fields['src'].fields[2][1].vocab
+        tok_vocab_size = len(tok_vocab)
+        conllu_ids = []
+        tok_idxs = []
+        for row_idx in range(src.shape[0]):
+            this_row = src[row_idx, 0, :]
+            tok_idx = this_row[0].tolist()
+            if tok_vocab.itos[tok_idx] in ['_(', ')_', '_form_suggestions_']:
+                continue
+            elif tok_vocab.itos[tok_idx] in ['<unk>']:
+                # Why do we do it this way instead of looking it up in the
+                # src_vocab? Because we don't have the token, only an unk.
+                # find the column number of this row in the src_map
+                this_src_map = src_map[row_idx, 0, :]
+                # is there a better way to do .index() in pytorch?
+                # https://stackoverflow.com/questions/47863001/how-pytorch-tensor-get-the-index-of-specific-value
+                src_sequence_idx = (this_src_map == 1).nonzero()[0][0].tolist()
+                # get the extended vocab idx of the unk token
+                tok_idx = src_sequence_idx + tok_vocab_size
+            # TODO there's an issue with the unk vocabthat form suggestions
+            # slips in
+            conllu_id = id_vocab.itos[this_row[2]]
+            # We ran into a single case of an unk in the conllu ids
+            if conllu_id in ['_', '<unk>']:
+                continue
+            tok_idxs.append(tok_idx)
+            conllu_ids.append(int(conllu_id))
+        return conllu_ids, tok_idxs
+
+
+    def _calc_descendent_counts(self, node):
+        n = 0
+        for child_node in node.children:
+            n = n + 1 + self._calc_descendent_counts(child_node)
+        node.desc_count = n
+        return n
+
+
+    def _get_src_counter(self, src_vocab, src, vocab_size):
+        extended_vocab_count = Counter()
+        for key, value in src_vocab.freqs.items():
+            if key in ['_(', ')_']:
+                continue
+            this_idx = src_vocab.stoi[key]
+            extended_idx = this_idx + vocab_size
+            extended_vocab_count[extended_idx] = value
+        original_vocab_count = Counter(
+            [tok for tok in src[:, 0, 0].tolist() if tok not in [0, 4, 5,]])
+        total_count = extended_vocab_count + original_vocab_count
+        # Don't forget EOS
+        total_count += Counter([3])
+        return total_count
+
+
+    def get_edges(self, nums, letters):
+        edge_dict = defaultdict(lambda: [])
+        for num, letter in zip(nums, letters):
+            edge_dict[letter].append(num)
+        return [edge_dict[letter] for letter in letters]
+
+
+    def find_match(self, edges, rm, cm, src):
+        frm = [None] * len(rm)
+        frm[src] = src
+        q = deque()
+        q.append(src)
+        found = False
+        while q and not found:
+            where = q.popleft()
+            for match in edges[where]:
+                nxt = cm[match]
+                if where != nxt:
+                    if nxt is None:
+                        found = True
+                        break
+                    if frm[nxt] is None:
+                        q.append(nxt)
+                        frm[nxt] = where
+        if not found:
+            return False
+        while frm[where] != where:
+            tmp = rm[where]
+            rm[where] = match
+            cm[match] = where
+            where = frm[where]
+            match = tmp
+        rm[where] = match
+        cm[match] = where
+        return True
+
+
+    def match_valid(self, edges, letters, sofar):
+        N = len(edges)
+        rm = [None] * N
+        cm = [None] * N
+        allowed = [True] * N
+        for used in sofar:
+            found = False
+            for x, letter in enumerate(letters):
+                if letter == used and allowed[x]:
+                    if not self.find_match(edges, rm, cm, x):
+                        return False
+                    found = True
+                    allowed[x] = False
+                    break
+            if not found:
+                return False
+        return True
+
+
     def translate_batch(self, batch, src_vocabs, attn_debug):
         """Translate a batch of sentences."""
+        # Get some extra stuff we need
+        # TODO it's possible that batch.src and .src_map won't return the same
+        # things they used to but this could work out of the box hopefully
+        conllu_ids, tok_idxs = self._get_src_ids(batch.src, batch.src_map)
+
         with torch.no_grad():
             if self.beam_size == 1:
                 decode_strategy = GreedySearch(
@@ -459,7 +612,9 @@ class Translator(object):
                     block_ngram_repeat=self.block_ngram_repeat,
                     exclusion_tokens=self._exclusion_idxs,
                     stepwise_penalty=self.stepwise_penalty,
-                    ratio=self.ratio)
+                    ratio=self.ratio,
+                    conllu_ids=conllu_ids
+                    tok_idxs=tok_idxs)
             return self._translate_batch_with_strategy(batch, src_vocabs,
                                                        decode_strategy)
 
@@ -616,6 +771,43 @@ class Translator(object):
             if parallel_paths > 1 or any_finished:
                 self.model.decoder.map_state(
                     lambda state, dim: state.index_select(dim, select_indices))
+
+		# TODO add an extra check as to whether we even need to use the bipartite 
+        # matching stuff
+        edges = self.get_edges(conllu_ids, tok_idxs)
+        idxs_to_ignore = []
+        preds = [this.tolist() for this in decode_strategy.predictions[0]]
+        num_ids = len(set(conllu_ids))
+        no_suggestions = len(conllu_ids) == num_ids
+        src_counter = Counter(tok_idxs)
+        for i, pred in enumerate(preds):
+            pred_len = len(pred)
+            pred_counter = Counter(pred)
+            # This means stuff appears in pred that shouldn't
+            if pred_counter - src_counter:
+                idxs_to_ignore.append(i)
+                continue
+            # no suggestions means don't need to check with match
+            if no_suggestions:
+                continue
+            # it's possible a shorter hyp may have slipped through
+            if pred_len < num_ids:
+                idxs_to_ignore.append(i)
+                continue
+            # if pred_len < 2:
+            #     continue
+            is_valid = self.match_valid(edges, tok_idxs, pred)
+            if is_valid:
+                continue
+            idxs_to_ignore.append(i)
+        # we add an extra check that if all of them are bad, then just output
+        # whatever
+        # TODO make an option to not output values if nothing satisfies, just
+        # when we need to use it to train the model
+        if len(preds) != len(idxs_to_ignore):
+            # it seems to work fine if we just remove the predictions
+            for idx in idxs_to_ignore:
+                decode_strategy.predictions[0][idx] = []
 
         results["scores"] = decode_strategy.scores
         results["predictions"] = decode_strategy.predictions

@@ -1,4 +1,6 @@
 import torch
+from collections import Counter
+
 from onmt.translate import penalties
 from onmt.translate.decode_strategy import DecodeStrategy
 from onmt.utils.misc import tile
@@ -58,7 +60,20 @@ class BeamSearch(DecodeStrategy):
     def __init__(self, beam_size, batch_size, pad, bos, eos, n_best,
                  global_scorer, min_length, max_length, return_attention,
                  block_ngram_repeat, exclusion_tokens,
-                 stepwise_penalty, ratio):
+                 stepwise_penalty, ratio, conllu_ids, tok_idxs):
+        # Our special parameters than need to be done before super()
+        min_length = len(set(conllu_ids))
+        max_length = min_length
+        self.src_counter = Counter(tok_idxs + [3])
+        # TODO we might not need these variables and could set max and min
+        # length in the above function. Though we might be introducing
+        # a new option for detecting whether or not there are duplicated forms
+        # in the inflection dict and hence can we do more comprehensive
+        # blocking
+        self.tok_idxs = tok_idxs
+        self.conllu_ids = conllu_ids
+
+
         super(BeamSearch, self).__init__(
             pad, bos, eos, batch_size, beam_size, min_length,
             block_ngram_repeat, exclusion_tokens, return_attention,
@@ -147,6 +162,26 @@ class BeamSearch(DecodeStrategy):
     def batch_offset(self):
         return self._batch_offset
 
+    # TODO it's possible that some of the variables used here have changed with
+    # the new opennmt code
+    def basic_restrict_repetition(self, log_probs):
+        for path_idx in range(self.alive_seq.shape[0]):
+            # Simpler restricted repetition
+            hyp = self.alive_seq[path_idx, 1:]
+            this_counter = Counter(hyp.tolist())
+            remaining_toks = self.src_counter - this_counter
+            self.mask_log_probs(log_probs, remaining_toks, path_idx)
+
+	def mask_log_probs(self, log_probs, allowed_tokens, path_idx):
+		disallowed_token_idxs = [True] * log_probs.size(-1)
+		for tok_idx in allowed_tokens:
+			disallowed_token_idxs[tok_idx] = False
+		# EOS is masked later on
+		disallowed_token_idxs[3] = False
+		# https://discuss.pytorch.org/t/slicing-tensor-using-boolean-list/7354/5
+		disallowed_lookup = torch.Tensor(disallowed_token_idxs) == True
+		log_probs[path_idx, disallowed_lookup] = -10e20
+
     def advance(self, log_probs, attn):
         vocab_size = log_probs.size(-1)
 
@@ -166,7 +201,10 @@ class BeamSearch(DecodeStrategy):
         # Multiply probs by the beam probability.
         log_probs += self.topk_log_probs.view(_B * self.beam_size, 1)
 
-        self.block_ngram_repeats(log_probs)
+        # We add our own version of blocking ngram repeat
+        # self.block_ngram_repeats(log_probs)
+        if self.block_ngram_repeat in [1]:
+            self.basic_restrict_repetition(log_probs)
 
         # if the sequence ends now, then the penalty is the current
         # length + 1, to include the EOS token
