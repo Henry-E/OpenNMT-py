@@ -1,5 +1,4 @@
 import torch
-from collections import Counter
 
 from onmt.translate.decode_strategy import DecodeStrategy
 
@@ -57,7 +56,7 @@ def sample_with_temperature(logits, sampling_temp, keep_topk):
     return topk_ids, topk_scores
 
 
-class RandomSampling(DecodeStrategy):
+class GreedySearch(DecodeStrategy):
     """Select next tokens randomly from the top k possible next tokens.
 
     The ``scores`` attribute's lists are the score, after applying temperature,
@@ -69,7 +68,6 @@ class RandomSampling(DecodeStrategy):
         bos (int): See base.
         eos (int): See base.
         batch_size (int): See base.
-        device (torch.device or str): See base ``device``.
         min_length (int): See base.
         max_length (int): See base.
         block_ngram_repeat (int): See base.
@@ -77,58 +75,49 @@ class RandomSampling(DecodeStrategy):
         return_attention (bool): See base.
         max_length (int): See base.
         sampling_temp (float): See
-            :func:`~onmt.translate.random_sampling.sample_with_temperature()`.
+            :func:`~onmt.translate.greedy_search.sample_with_temperature()`.
         keep_topk (int): See
-            :func:`~onmt.translate.random_sampling.sample_with_temperature()`.
-        memory_length (LongTensor): Lengths of encodings. Used for
-            masking attention.
+            :func:`~onmt.translate.greedy_search.sample_with_temperature()`.
     """
 
-    def __init__(self, pad, bos, eos, batch_size, device,
-                 min_length, block_ngram_repeat, exclusion_tokens,
-                 return_attention, max_length, sampling_temp, keep_topk,
-                 memory_length, conllu_ids, tok_idxs):
-        # All the restrict repetition bits
-        min_length = len(set(conllu_ids))
-        max_length = min_length
-        self.tok_idxs = tok_idxs
-        self.conllu_ids = conllu_ids
-        self.src_counter = Counter(tok_idxs + [3])
-
-        super(RandomSampling, self).__init__(
-            pad, bos, eos, batch_size, device, 1,
-            min_length, block_ngram_repeat, exclusion_tokens,
-            return_attention, max_length)
+    def __init__(self, pad, bos, eos, batch_size, min_length,
+                 block_ngram_repeat, exclusion_tokens, return_attention,
+                 max_length, sampling_temp, keep_topk):
+        assert block_ngram_repeat == 0
+        super(GreedySearch, self).__init__(
+            pad, bos, eos, batch_size, 1, min_length, block_ngram_repeat,
+            exclusion_tokens, return_attention, max_length)
         self.sampling_temp = sampling_temp
         self.keep_topk = keep_topk
         self.topk_scores = None
-        self.memory_length = memory_length
-        self.batch_size = batch_size
-        self.select_indices = torch.arange(self.batch_size,
-                                           dtype=torch.long, device=device)
-        self.original_batch_idx = torch.arange(self.batch_size,
-                                               dtype=torch.long, device=device)
 
+    def initialize(self, memory_bank, src_lengths, src_map=None, device=None):
+        """Initialize for decoding."""
+        fn_map_state = None
 
-    def mask_log_probs(self, log_probs, allowed_tokens, path_idx):
-        disallowed_token_idxs = [True] * log_probs.size(-1)
-        for tok_idx in allowed_tokens:
-            disallowed_token_idxs[tok_idx] = False
-        # EOS is masked later on
-        disallowed_token_idxs[3] = False
-        # https://discuss.pytorch.org/t/slicing-tensor-using-boolean-list/7354/5
-        disallowed_lookup = torch.Tensor(disallowed_token_idxs) == True
-        log_probs[path_idx, disallowed_lookup] = -10e20
+        if isinstance(memory_bank, tuple):
+            mb_device = memory_bank[0].device
+        else:
+            mb_device = memory_bank.device
+        if device is None:
+            device = mb_device
 
+        self.memory_lengths = src_lengths
+        super(GreedySearch, self).initialize(
+            memory_bank, src_lengths, src_map, device)
+        self.select_indices = torch.arange(
+            self.batch_size, dtype=torch.long, device=device)
+        self.original_batch_idx = torch.arange(
+            self.batch_size, dtype=torch.long, device=device)
+        return fn_map_state, memory_bank, self.memory_lengths, src_map
 
-    def basic_restrict_repetition(self, log_probs):
-        for path_idx in range(self.alive_seq.shape[0]):
-            # Simpler restricted repetition
-            hyp = self.alive_seq[path_idx, 1:]
-            this_counter = Counter(hyp.tolist())
-            remaining_toks = self.src_counter - this_counter
-            self.mask_log_probs(log_probs, remaining_toks, path_idx)
+    @property
+    def current_predictions(self):
+        return self.alive_seq[:, -1]
 
+    @property
+    def batch_offset(self):
+        return self.select_indices
 
     def advance(self, log_probs, attn):
         """Select next tokens randomly from the top k possible next tokens.
@@ -144,8 +133,7 @@ class RandomSampling(DecodeStrategy):
         """
 
         self.ensure_min_length(log_probs)
-        self.basic_restrict_repetition(log_probs)
-        # self.block_ngram_repeats(log_probs)
+        self.block_ngram_repeats(log_probs)
         topk_ids, self.topk_scores = sample_with_temperature(
             log_probs, self.sampling_temp, self.keep_topk)
 
@@ -168,7 +156,7 @@ class RandomSampling(DecodeStrategy):
             self.scores[b_orig].append(self.topk_scores[b, 0])
             self.predictions[b_orig].append(self.alive_seq[b, 1:])
             self.attention[b_orig].append(
-                self.alive_attn[:, b, :self.memory_length[b]]
+                self.alive_attn[:, b, :self.memory_lengths[b]]
                 if self.alive_attn is not None else [])
         self.done = self.is_finished.all()
         if self.done:
