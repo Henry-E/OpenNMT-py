@@ -613,7 +613,7 @@ class Translator(object):
                     exclusion_tokens=self._exclusion_idxs,
                     stepwise_penalty=self.stepwise_penalty,
                     ratio=self.ratio,
-                    conllu_ids=conllu_ids
+                    conllu_ids=conllu_ids,
                     tok_idxs=tok_idxs)
             return self._translate_batch_with_strategy(batch, src_vocabs,
                                                        decode_strategy)

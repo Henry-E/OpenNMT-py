@@ -1,7 +1,7 @@
 import os
 import torch
 
-from collections import deque
+# from collections import deque
 from onmt.utils.logging import logger
 
 from copy import deepcopy
@@ -35,9 +35,10 @@ class ModelSaverBase(object):
         self.last_saved_step = None
         self.keep_checkpoint = keep_checkpoint
         if keep_checkpoint > 0:
-            self.checkpoint_queue = deque([], maxlen=keep_checkpoint)
+            self.checkpoints = []
+            self.max_checkpoints = keep_checkpoint
 
-    def save(self, step, moving_average=None):
+    def save(self, step, moving_average=None, valid_stats=None):
         """Main entry point for model saver
 
         It wraps the `_save` method with checks and apply `keep_checkpoint`
@@ -54,7 +55,7 @@ class ModelSaverBase(object):
                 model_params_data.append(param.data)
                 param.data = avg.data
 
-        chkpt, chkpt_name = self._save(step, save_model)
+        chkpt, chkpt_name = self._save(step, save_model, valid_stats)
         self.last_saved_step = step
 
         if moving_average:
@@ -63,10 +64,11 @@ class ModelSaverBase(object):
                 param.data = param_data
 
         if self.keep_checkpoint > 0:
-            if len(self.checkpoint_queue) == self.checkpoint_queue.maxlen:
-                todel = self.checkpoint_queue.popleft()
+            self.checkpoints.append((chkpt_name, valid_stats.accuracy()))
+            if len(self.checkpoints) > self.max_checkpoints:
+                self.checkpoints.sort(key=lambda tup: tup[1], reverse=True)
+                todel = self.checkpoints.pop()[0]
                 self._rm_checkpoint(todel)
-            self.checkpoint_queue.append(chkpt_name)
 
     def _save(self, step):
         """Save a resumable checkpoint.
@@ -97,7 +99,7 @@ class ModelSaverBase(object):
 class ModelSaver(ModelSaverBase):
     """Simple model saver to filesystem"""
 
-    def _save(self, step, model):
+    def _save(self, step, model, valid_stats=None):
         model_state_dict = model.state_dict()
         model_state_dict = {k: v for k, v in model_state_dict.items()
                             if 'generator' not in k}
@@ -125,8 +127,10 @@ class ModelSaver(ModelSaverBase):
             'optim': self.optim.state_dict(),
         }
 
-        logger.info("Saving checkpoint %s_step_%d.pt" % (self.base_path, step))
-        checkpoint_path = '%s_step_%d.pt' % (self.base_path, step)
+        logger.info("Saving checkpoint %s_acc_%.2f_step_%d.pt" %
+                (self.base_path, valid_stats.accuracy(), step))
+        checkpoint_path = '%s_acc_%.2f_step_%d.pt' % (self.base_path,
+                valid_stats.accuracy(), step)
         torch.save(checkpoint, checkpoint_path)
         return checkpoint, checkpoint_path
 
