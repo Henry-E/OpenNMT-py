@@ -172,15 +172,15 @@ class BeamSearch(DecodeStrategy):
             remaining_toks = self.src_counter - this_counter
             self.mask_log_probs(log_probs, remaining_toks, path_idx)
 
-	def mask_log_probs(self, log_probs, allowed_tokens, path_idx):
-		disallowed_token_idxs = [True] * log_probs.size(-1)
-		for tok_idx in allowed_tokens:
-			disallowed_token_idxs[tok_idx] = False
-		# EOS is masked later on
-		disallowed_token_idxs[3] = False
-		# https://discuss.pytorch.org/t/slicing-tensor-using-boolean-list/7354/5
-		disallowed_lookup = torch.Tensor(disallowed_token_idxs) == True
-		log_probs[path_idx, disallowed_lookup] = -10e20
+    def mask_log_probs(self, log_probs, allowed_tokens, path_idx):
+        disallowed_token_idxs = [True] * log_probs.size(-1)
+        for tok_idx in allowed_tokens:
+            disallowed_token_idxs[tok_idx] = False
+        # EOS is masked later on
+        disallowed_token_idxs[3] = False
+        # https://discuss.pytorch.org/t/slicing-tensor-using-boolean-list/7354/5
+        disallowed_lookup = torch.Tensor(disallowed_token_idxs) == True
+        log_probs[path_idx, disallowed_lookup] = -10e20
 
     def advance(self, log_probs, attn):
         vocab_size = log_probs.size(-1)

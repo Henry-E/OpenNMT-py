@@ -430,38 +430,38 @@ class Translator(object):
         return all_scores, all_predictions
 
 
-    def _get_src_tree(self, src, src_map):
-        tok_vocab = self.fields['src'].fields[0][1].vocab
-        id_vocab = self.fields['src'].fields[2][1].vocab
-        head_vocab = self.fields['src'].fields[3][1].vocab
-        tok_vocab_size = len(tok_vocab)
-        all_nodes = {}
-        for row_idx in range(src.shape[0]):
-            this_row = src[row_idx, 0, :]
-            tok_idx = this_row[0].tolist()
-            if tok_vocab.itos[tok_idx] in ['_(', ')_']:
-                continue
-            elif tok_vocab.itos[tok_idx] in ['<unk>']:
-                # Why do we do it this way instead of looking it up in the
-                # src_vocab? Because we don't have the token, only an unk.
-                # find the column number of this row in the src_map
-                # TODO figure out why src_map has one map for each beam?
-                this_src_map = src_map[row_idx, 0, :]
-                # TODO is there a better way to do .index() in pytorch?
-                # https://stackoverflow.com/questions/47863001/how-pytorch-tensor-get-the-index-of-specific-value
-                src_sequence_idx = (this_src_map == 1).nonzero()[0][0].tolist()
-                # get the extended vocab idx of the unk token
-                tok_idx = src_sequence_idx + tok_vocab_size
-            conllu_id = id_vocab.itos[this_row[2]]
-            conllu_head = head_vocab.itos[this_row[3]]
-            if conllu_head in ['0']:
-                # We're at the root node
-                all_nodes[conllu_id] = Node(conllu_id, tok_idx=tok_idx)
-            else:
-                all_nodes[conllu_id] = Node(
-                    conllu_id, parent=all_nodes[conllu_head], tok_idx=tok_idx)
-        self._calc_descendent_counts(all_nodes['1'])
-        return all_nodes
+    # def _get_src_tree(self, src, src_map):
+    #     tok_vocab = self.fields['src'].fields[0][1].vocab
+    #     id_vocab = self.fields['src'].fields[2][1].vocab
+    #     head_vocab = self.fields['src'].fields[3][1].vocab
+    #     tok_vocab_size = len(tok_vocab)
+    #     all_nodes = {}
+    #     for row_idx in range(src.shape[0]):
+    #         this_row = src[row_idx, 0, :]
+    #         tok_idx = this_row[0].tolist()
+    #         if tok_vocab.itos[tok_idx] in ['_(', ')_']:
+    #             continue
+    #         elif tok_vocab.itos[tok_idx] in ['<unk>']:
+    #             # Why do we do it this way instead of looking it up in the
+    #             # src_vocab? Because we don't have the token, only an unk.
+    #             # find the column number of this row in the src_map
+    #             # TODO figure out why src_map has one map for each beam?
+    #             this_src_map = src_map[row_idx, 0, :]
+    #             # TODO is there a better way to do .index() in pytorch?
+    #             # https://stackoverflow.com/questions/47863001/how-pytorch-tensor-get-the-index-of-specific-value
+    #             src_sequence_idx = (this_src_map == 1).nonzero()[0][0].tolist()
+    #             # get the extended vocab idx of the unk token
+    #             tok_idx = src_sequence_idx + tok_vocab_size
+    #         conllu_id = id_vocab.itos[this_row[2]]
+    #         conllu_head = head_vocab.itos[this_row[3]]
+    #         if conllu_head in ['0']:
+    #             # We're at the root node
+    #             all_nodes[conllu_id] = Node(conllu_id, tok_idx=tok_idx)
+    #         else:
+    #             all_nodes[conllu_id] = Node(
+    #                 conllu_id, parent=all_nodes[conllu_head], tok_idx=tok_idx)
+    #     self._calc_descendent_counts(all_nodes['1'])
+    #     return all_nodes
 
 
     def _get_src_ids(self, src, src_map):
@@ -470,8 +470,8 @@ class Translator(object):
         tok_vocab_size = len(tok_vocab)
         conllu_ids = []
         tok_idxs = []
-        for row_idx in range(src.shape[0]):
-            this_row = src[row_idx, 0, :]
+        for row_idx in range(src[0].shape[0]):
+            this_row = src[0][row_idx, 0, :]
             tok_idx = this_row[0].tolist()
             if tok_vocab.itos[tok_idx] in ['_(', ')_', '_form_suggestions_']:
                 continue
@@ -513,7 +513,7 @@ class Translator(object):
             extended_idx = this_idx + vocab_size
             extended_vocab_count[extended_idx] = value
         original_vocab_count = Counter(
-            [tok for tok in src[:, 0, 0].tolist() if tok not in [0, 4, 5,]])
+            [tok for tok in src[0][:, 0, 0].tolist() if tok not in [0, 4, 5,]])
         total_count = extended_vocab_count + original_vocab_count
         # Don't forget EOS
         total_count += Counter([3])
@@ -774,40 +774,44 @@ class Translator(object):
 
 		# TODO add an extra check as to whether we even need to use the bipartite 
         # matching stuff
-        edges = self.get_edges(conllu_ids, tok_idxs)
-        idxs_to_ignore = []
-        preds = [this.tolist() for this in decode_strategy.predictions[0]]
-        num_ids = len(set(conllu_ids))
-        no_suggestions = len(conllu_ids) == num_ids
-        src_counter = Counter(tok_idxs)
-        for i, pred in enumerate(preds):
-            pred_len = len(pred)
-            pred_counter = Counter(pred)
-            # This means stuff appears in pred that shouldn't
-            if pred_counter - src_counter:
+        # This is a quick fix because of the changes in the master repo
+        if decode_strategy.block_ngram_repeat in [1]:
+            conllu_ids = decode_strategy.conllu_ids
+            tok_idxs = decode_strategy.tok_idxs
+            edges = self.get_edges(conllu_ids, tok_idxs)
+            idxs_to_ignore = []
+            preds = [this.tolist() for this in decode_strategy.predictions[0]]
+            num_ids = len(set(conllu_ids))
+            no_suggestions = len(conllu_ids) == num_ids
+            src_counter = Counter(tok_idxs)
+            for i, pred in enumerate(preds):
+                pred_len = len(pred)
+                pred_counter = Counter(pred)
+                # This means stuff appears in pred that shouldn't
+                if pred_counter - src_counter:
+                    idxs_to_ignore.append(i)
+                    continue
+                # no suggestions means don't need to check with match
+                if no_suggestions:
+                    continue
+                # it's possible a shorter hyp may have slipped through
+                if pred_len < num_ids:
+                    idxs_to_ignore.append(i)
+                    continue
+                # if pred_len < 2:
+                #     continue
+                is_valid = self.match_valid(edges, tok_idxs, pred)
+                if is_valid:
+                    continue
                 idxs_to_ignore.append(i)
-                continue
-            # no suggestions means don't need to check with match
-            if no_suggestions:
-                continue
-            # it's possible a shorter hyp may have slipped through
-            if pred_len < num_ids:
-                idxs_to_ignore.append(i)
-                continue
-            # if pred_len < 2:
-            #     continue
-            is_valid = self.match_valid(edges, tok_idxs, pred)
-            if is_valid:
-                continue
-            idxs_to_ignore.append(i)
-        # we add an extra check that if all of them are bad, then just output
-        # whatever
-        # TODO make an option to not output values if nothing satisfies, just
-        # when we need to use it to train the model
-        if len(preds) != len(idxs_to_ignore):
-            # it seems to work fine if we just remove the predictions
-            for idx in idxs_to_ignore:
-                decode_strategy.predictions[0][idx] = []
+            # we add an extra check that if all of them are bad, then just output
+            # whatever
+            # TODO make an option to not output values if nothing satisfies, just
+            # when we need to use it to train the model
+            if len(preds) != len(idxs_to_ignore):
+                # it seems to work fine if we just remove the predictions
+                for idx in idxs_to_ignore:
+                    decode_strategy.predictions[0][idx] = []
 
         results["scores"] = decode_strategy.scores
         results["predictions"] = decode_strategy.predictions
